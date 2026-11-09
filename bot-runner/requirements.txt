@@ -1,7 +1,7 @@
 # bot-runner image dependencies.
-# The runner itself uses only the standard library, but the user bots it
-# spawns are Pyrogram bots, so their runtime deps are installed here once
-# (each bot's own requirements.txt is also pip-installed best-effort).
+# The runner itself needs cryptography (Fernet token decryption), and the
+# user bots it spawns are Pyrogram bots, so their runtime deps are installed
+# here once (each bot's own requirements.txt is also pip-installed best-effort).
 pyrogram
 tgcrypto
 python-dotenv
