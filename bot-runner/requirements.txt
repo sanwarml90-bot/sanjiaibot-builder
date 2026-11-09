@@ -5,3 +5,12 @@
 pyrogram
 tgcrypto
 python-dotenv
+cryptography
+
+
+
+
+
+
+
+
