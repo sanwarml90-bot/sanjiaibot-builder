@@ -355,7 +355,7 @@ async def run_build_job(uid: int, data: dict) -> None:
         await update(1, "doing")
         code, source = await asyncio.to_thread(codegen.generate_bot_code, idea)
         await update(1, "done")
-        note(f"Code likh liya ({'AI se' if source == 'groq' else 'template se'}). ✅")
+        note(f"Code likh liya ({'AI se' if source in ('groq', 'openrouter') else 'template se'}). ✅")
 
         # 2. GitHub repo + push
         await update(2, "doing")
