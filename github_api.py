@@ -64,6 +64,24 @@ def create_repo(name: str, description: str = "") -> dict:
     })
 
 
+def get_file(owner: str, repo: str, path: str, branch: str = "main") -> str | None:
+    """Fetch a file's decoded text via the Contents API. None if missing (404).
+
+    The Contents API returns base64 content (line-wrapped), so whitespace
+    is stripped before decoding.
+    """
+    try:
+        info = _request("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+    except GitHubError as exc:
+        if "404" in str(exc):
+            return None
+        raise
+    content = info.get("content", "")
+    if info.get("encoding") == "base64":
+        return base64.b64decode("".join(content.split())).decode("utf-8")
+    return content
+
+
 def _file_sha(owner: str, repo: str, path: str, branch: str) -> str | None:
     try:
         info = _request("GET", f"/repos/{owner}/{repo}/contents/{path}?ref={branch}")

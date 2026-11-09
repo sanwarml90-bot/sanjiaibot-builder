@@ -2,20 +2,29 @@
 
 DM-only Telegram bot. Two flows:
   /newbot  — user gives a bot idea + a BotFather token; the agent writes the
-             bot code (Groq), creates a GitHub repo, deploys it on Railway,
-             tests it and reports progress + logs. It retries failures and
-             does not stop until the bot is live or a hard failure is reported.
+             bot code (AI), creates a GitHub repo, registers the bot in the
+             bot-runner registry file (bot-runner/bots.json in this repo),
+             and the Northflank bot-runner service picks it up and runs it.
+             It tests the token and reports progress + logs. It retries code
+             failures and does not stop until the bot is live or a hard
+             failure is reported.
   /userbot — user gives a phone number; the agent takes the OTP and (if set)
              the 2FA password, then generates and returns the Pyrogram session
              string plus the API ID / API hash.
 
 Group replies are OFF by design (builder only). OTPs, passwords and session
 strings are used transiently, never stored or logged. User bot tokens are
-kept in memory only and never written to disk or logs.
+Fernet-encrypted (FERNET_KEY) before being written to the registry file —
+the registry lives in a PUBLIC repo, so a plaintext token must never be
+written there. No Northflank API is used: Northflank's "Create API token"
+button is broken (ongoing Northflank security incident since 2026-10-30),
+so the runner polls the registry file instead, and the runner service is
+created once via the Northflank dashboard.
 """
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 import os
@@ -35,7 +44,6 @@ from pyrogram.types import Message
 
 import codegen
 import github_api
-import railway_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sanjiaibot-builder")
@@ -45,7 +53,16 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "7966027018") or 7966027018)
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "sanwarml90-bot")
-RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID", "")
+# Registry file the bot-runner polls: bot-runner/bots.json inside THIS repo
+# (the sanjiaibot-builder repo, owned by GITHUB_OWNER, branch main).
+# Tokens in it are Fernet-encrypted — the repo is PUBLIC, so plaintext
+# tokens must never be written there.
+REGISTRY_REPO = "sanjiaibot-builder"
+REGISTRY_PATH = "bot-runner/bots.json"
+REGISTRY_BRANCH = "main"
+# Seconds the runner needs to notice a new registry entry (it polls every
+# 60s) before the test step runs.
+REGISTRY_PICKUP_WAIT_S = 90
 MAX_BUILD_ATTEMPTS = 3
 
 # --- token protection: Fernet when available, plain in-memory otherwise ---
@@ -68,6 +85,57 @@ def _unprotect(value: str) -> str:
     if value.startswith("plain:"):
         return value[len("plain:"):]
     return value
+
+
+# ---------------------------------------------------------------- registry
+def _read_registry() -> list[dict]:
+    """Read bot-runner/bots.json from the builder repo. [] if missing/invalid."""
+    raw = github_api.get_file(GITHUB_OWNER, REGISTRY_REPO, REGISTRY_PATH, REGISTRY_BRANCH)
+    if raw is None:
+        return []
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("registry %s is not valid JSON — treating as empty", REGISTRY_PATH)
+        return []
+    if not isinstance(entries, list):
+        log.warning("registry %s is not a JSON list — treating as empty", REGISTRY_PATH)
+        return []
+    return entries
+
+
+def _write_registry(entries: list[dict], bot_username: str) -> None:
+    """Write the registry back to the builder repo (one commit).
+
+    Refuses to run without FERNET_KEY: the registry lives in a PUBLIC repo,
+    so a token written without encryption would leak. Every entry's token
+    must already be Fernet-encrypted (see _protect).
+    """
+    if _fernet is None:
+        raise RuntimeError(
+            "FERNET_KEY is not configured — refusing to write bot tokens to "
+            "the public registry file unencrypted. Set FERNET_KEY and retry."
+        )
+    for entry in entries:
+        token = str(entry.get("token") or "")
+        if not token.startswith("fernet:"):
+            raise RuntimeError(
+                f"Registry entry @{entry.get('username')} has no encrypted token — "
+                "refusing to write it to the public registry file."
+            )
+    content = json.dumps(entries, indent=2) + "\n"
+    github_api.put_file(
+        GITHUB_OWNER, REGISTRY_REPO, REGISTRY_PATH, content,
+        f"Register bot @{bot_username} in the runner registry", REGISTRY_BRANCH)
+
+
+def _code_syntax_ok(code: str) -> str | None:
+    """Return the SyntaxError message, or None if the code parses."""
+    try:
+        ast.parse(code)
+        return None
+    except SyntaxError as exc:
+        return f"{exc.msg} (line {exc.lineno})"
 
 
 app = Client("sanjiaibot-builder", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -119,7 +187,7 @@ async def cmd_start(client: Client, message: Message):
         "Namaste! Main **Sanji AI** hun — bot banane wala agent. 🤖\n\n"
         "Main ye kar sakta hun:\n"
         "• **/newbot** — apne bot ka idea batao + BotFather token do, "
-        "main code likh ke GitHub pe daal ke Railway pe live kar dunga, test kar ke. "
+        "main code likh ke GitHub pe daal ke Northflank pe live kar dunga, test kar ke. "
         "Progress aur logs yahin dikhata rahunga.\n"
         "• **/userbot** — apna number do, OTP aur password do, "
         "main session string + API ID/hash nikal ke de dunga.\n\n"
@@ -335,7 +403,7 @@ async def run_build_job(uid: int, data: dict) -> None:
         ("Idea samajh liya", "done"),
         ("Bot ka code likh raha hun", "todo"),
         ("GitHub repo bana raha hun", "todo"),
-        ("Railway pe deploy kar raha hun", "todo"),
+        ("Northflank runner pe register kar raha hun", "todo"),
         ("Bot ko test kar raha hun", "todo"),
     ]
     progress = await app.send_message(uid, _progress_text("🔨 Bot build ho raha hai…", steps))
@@ -351,9 +419,21 @@ async def run_build_job(uid: int, data: dict) -> None:
         asyncio.create_task(app.send_message(uid, text))
 
     try:
-        # 1. Code generation
+        # 1. Code generation (+ syntax check / fix loop for CODE errors only)
         await update(1, "doing")
         code, source = await asyncio.to_thread(codegen.generate_bot_code, idea)
+        for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
+            err = await asyncio.to_thread(_code_syntax_ok, code)
+            if err is None:
+                break
+            if attempt < MAX_BUILD_ATTEMPTS:
+                note(f"Code mein syntax error hai ({err}) — AI se fix kar raha hun…")
+                fixed, _ = await asyncio.to_thread(codegen.fix_bot_code, code, err)
+                code = fixed
+            else:
+                raise RuntimeError(
+                    f"Bot code mein syntax error hai aur {MAX_BUILD_ATTEMPTS} baar "
+                    f"fix nahi hua: {err}")
         await update(1, "done")
         note(f"Code likh liya ({'AI se' if source in ('groq', 'openrouter') else 'template se'}). ✅")
 
@@ -382,58 +462,26 @@ async def run_build_job(uid: int, data: dict) -> None:
         await update(2, "done")
         note(f"GitHub repo ban gaya: https://github.com/{GITHUB_OWNER}/{repo} ✅")
 
-        # 3. Railway deploy (with fix + retry loop)
+        # 3. Register the bot in the runner's GitHub-file registry.
+        # No Northflank API (its token creation is broken): the runner polls
+        # bot-runner/bots.json in this repo every 60s and starts any bot
+        # listed there. The token is Fernet-encrypted before being written
+        # (the repo is PUBLIC — a plaintext token must never land in it).
         await update(3, "doing")
-        if not RAILWAY_PROJECT_ID:
-            raise RuntimeError("RAILWAY_PROJECT_ID is not configured on the builder")
-        env_id = await asyncio.to_thread(railway_api.get_production_env_id, RAILWAY_PROJECT_ID)
-        service_id = await asyncio.to_thread(
-            railway_api.create_service, RAILWAY_PROJECT_ID, env_id,
-            f"{GITHUB_OWNER}/{repo}", "main")
-        await asyncio.to_thread(
-            railway_api.update_service, service_id, env_id, "python bot.py")
-        await asyncio.to_thread(
-            railway_api.set_variables, RAILWAY_PROJECT_ID, env_id, service_id,
-            {"BOT_TOKEN": token, "API_ID": str(API_ID), "API_HASH": API_HASH},
-            skip_deploys=True)
-        await asyncio.to_thread(railway_api.deploy_service, service_id, env_id)
-
-        status, dep_id = ("UNKNOWN", "")
-        last_logs = ""
-        for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
-            status, dep_id = await asyncio.to_thread(
-                railway_api.wait_for_deployment, service_id, 600, 15)
-            if status == "SUCCESS":
-                break
-            last_logs = await asyncio.to_thread(railway_api.log_tail, dep_id, 40)
-            if attempt < MAX_BUILD_ATTEMPTS:
-                note(
-                    f"Deploy attempt {attempt} fail hua — log dekh ke code fix kar raha hun…\n"
-                    f"```\n{last_logs[-1500:]}\n```"
-                )
-                fixed, _ = await asyncio.to_thread(codegen.fix_bot_code, code, last_logs)
-                code = fixed
-                await asyncio.to_thread(
-                    github_api.put_file, GITHUB_OWNER, repo, "bot.py", code,
-                    "Fix from deploy logs", "main")
-                await asyncio.to_thread(railway_api.deploy_service, service_id, env_id)
-            else:
-                note(
-                    "Deploy 3 baar fail hua. Aakhri log:\n"
-                    f"```\n{last_logs[-1500:]}\n```\n"
-                    "Ye log mujhe bhej do, main khud dekh lunga."
-                )
-        if status != "SUCCESS":
-            await update(3, "fail")
-            await progress.edit_text(
-                _progress_text("🔨 Bot build ho raha hai…", steps)
-                + "\n\n❌ Deploy nahi ho paya. Upar wala log dekh lo, ya /newbot se dobara try karo."
-            )
-            return
+        entries = await asyncio.to_thread(_read_registry)
+        entries = [e for e in entries if e.get("username") != bot_username]
+        entries.append({"username": bot_username,
+                        "repo": f"{GITHUB_OWNER}/{repo}",
+                        "token": _protect(token)})
+        await asyncio.to_thread(_write_registry, entries, bot_username)
         await update(3, "done")
+        note(f"Bot register kar diya — runner thodi der mein @{bot_username} start kar dega. ✅")
 
-        # 4. Test: token valid + bot answers getMe
+        # 4. Test: wait for the runner to pick the bot up, then verify the
+        # token via getMe. A getMe failure is a TOKEN error — do not retry
+        # the code for it.
         await update(4, "doing")
+        await asyncio.sleep(REGISTRY_PICKUP_WAIT_S)
         info = await asyncio.to_thread(_bot_api_getme, token)
         if not info:
             await update(4, "fail")
