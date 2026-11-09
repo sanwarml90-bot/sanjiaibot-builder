@@ -1,8 +1,9 @@
 """Code generation for the Sanji AI builder agent.
 
-Uses Groq (free tier) to write a complete Pyrogram Telegram bot from a
-user's idea. Falls back to a generic template bot when Groq is unavailable
-or no key is configured. Never logs or stores any secret.
+Uses OpenRouter (free tier, cohere/north-mini-code) first to write a complete
+Pyrogram Telegram bot from a user's idea, then Groq as a fallback. Falls back
+to a generic template bot when no AI key is configured or all AI fails.
+Never logs or stores any secret.
 """
 from __future__ import annotations
 
@@ -15,6 +16,10 @@ import urllib.request
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
+
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Free coding model on OpenRouter (verified 2026-11-09, cost 0). Override via env.
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "cohere/north-mini-code:free")
 
 SYSTEM_PROMPT = """You are an expert Python developer writing Telegram bots with Pyrogram.
 Write ONE complete, working bot.py. Rules:
@@ -51,6 +56,32 @@ def _groq_chat(prompt: str, model: str, api_key: str, timeout: int = 120) -> str
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
+
+
+def _openrouter_chat(prompt: str, model: str, api_key: str, timeout: int = 180) -> str:
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 8000,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        OPENROUTER_API_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/sanwarml90-bot/sanjiaibot-builder",
+            "X-Title": "Sanji Bot Factory",
         },
         method="POST",
     )
@@ -112,34 +143,40 @@ app.run()
 def generate_bot_code(idea: str) -> tuple[str, str]:
     """Generate bot.py source for an idea.
 
-    Returns (code, source) where source is 'groq' or 'template'.
-    Raises RuntimeError if Groq is configured but fails and no code results.
+    Returns (code, source) where source is 'openrouter', 'groq' or 'template'.
+    Tries OpenRouter (free coding model) first, then Groq, then the template.
     """
+    prompt = USER_PROMPT_TEMPLATE.format(idea=idea)
+    # 1. OpenRouter (free coding model) — primary.
+    or_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if or_key:
+        try:
+            raw = _openrouter_chat(prompt, OPENROUTER_MODEL, or_key)
+            code = _strip_fences(raw)
+            if code and _syntax_ok(code):
+                return code, "openrouter"
+        except Exception:  # noqa: BLE001 - fall through to Groq/template
+            pass
+    # 2. Groq — fallback.
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if api_key:
-        last_err = None
         for model in (GROQ_MODEL, GROQ_FALLBACK_MODEL):
             try:
-                raw = _groq_chat(USER_PROMPT_TEMPLATE.format(idea=idea), model, api_key)
+                raw = _groq_chat(prompt, model, api_key)
                 code = _strip_fences(raw)
                 if code and _syntax_ok(code):
                     return code, "groq"
-                last_err = "Groq returned code with a syntax error"
-            except Exception as exc:  # noqa: BLE001 - report as failure, fall through
-                last_err = str(exc)
-        # Groq configured but unusable: fall back to template rather than fail.
-        _ = last_err
+            except Exception:  # noqa: BLE001 - fall through to template
+                pass
     return FALLBACK_TEMPLATE, "template"
 
 
 def fix_bot_code(code: str, error_log: str) -> tuple[str, str]:
-    """Ask Groq to fix bot code given a deploy/runtime error log.
+    """Ask AI to fix bot code given a deploy/runtime error log.
 
-    Returns (fixed_code, source). Falls back to the original code on failure.
+    Tries OpenRouter first, then Groq. Returns (fixed_code, source).
+    Falls back to the original code on failure.
     """
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        return code, "unchanged"
     prompt = (
         "Fix this Pyrogram Telegram bot code so it runs without errors.\n\n"
         f"ERROR LOG (last lines):\n{error_log[-4000:]}\n\n"
@@ -147,6 +184,18 @@ def fix_bot_code(code: str, error_log: str) -> tuple[str, str]:
         "Reply with ONLY the complete fixed Python code, no markdown fences, no explanation. "
         "Keep BOT_TOKEN, API_ID, API_HASH from os.environ. End with app.run()."
     )
+    or_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if or_key:
+        try:
+            raw = _openrouter_chat(prompt, OPENROUTER_MODEL, or_key)
+            fixed = _strip_fences(raw)
+            if fixed and _syntax_ok(fixed):
+                return fixed, "openrouter-fix"
+        except Exception:  # noqa: BLE001 - fall through to Groq
+            pass
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return code, "unchanged"
     try:
         raw = _groq_chat(prompt, GROQ_MODEL, api_key)
         fixed = _strip_fences(raw)
