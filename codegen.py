@@ -1,25 +1,35 @@
 """Code generation for the Sanji AI builder agent.
 
-Uses OpenRouter (free tier, cohere/north-mini-code) first to write a complete
-Pyrogram Telegram bot from a user's idea, then Groq as a fallback. Falls back
-to a generic template bot when no AI key is configured or all AI fails.
-Never logs or stores any secret.
+Uses OpenRouter (free tier) first to write a complete Pyrogram Telegram
+bot from a user's idea, then Groq as a fallback. Falls back to a generic
+template bot when no AI key is configured or all AI fails. Every AI
+failure is logged (exception type + HTTP status, never any secret).
 """
 from __future__ import annotations
 
 import ast
 import json
+import logging
 import os
 import re
+import urllib.error
 import urllib.request
+
+log = logging.getLogger(__name__)
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_FALLBACK_MODEL = os.environ.get("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Free coding model on OpenRouter (verified 2026-11-09, cost 0). Override via env.
+# Free coding models on OpenRouter, tried in this order (verified 2026-11-09,
+# cost 0). OPENROUTER_MODEL overrides the first model; "openrouter/free" is
+# always tried second so one dead model can no longer silently drop to the
+# template.
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "cohere/north-mini-code:free")
+OPENROUTER_MODELS = [OPENROUTER_MODEL] + (
+    [] if OPENROUTER_MODEL == "openrouter/free" else ["openrouter/free"]
+)
 
 SYSTEM_PROMPT = """You are an expert Python developer writing Telegram bots with Pyrogram.
 Write ONE complete, working bot.py. Rules:
@@ -106,6 +116,28 @@ def _syntax_ok(code: str) -> bool:
         return False
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """HTTP status code of an API failure, when the exception carries one."""
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _log_ai_failure(provider: str, model: str, exc: BaseException) -> None:
+    """Log an AI call failure: exception type + HTTP status code.
+
+    Never logs any API key — only the exception type, its message and the
+    HTTP status (e.g. HTTPError 404/429). The key is never part of the
+    exception, the request body or anything logged here.
+    """
+    status = _http_status(exc)
+    if status is not None:
+        log.warning("%s model %s failed: %s (HTTP %s)",
+                    provider, model, type(exc).__name__, status)
+    else:
+        log.warning("%s model %s failed: %s: %s",
+                    provider, model, type(exc).__name__, exc)
+
+
 FALLBACK_TEMPLATE = '''"""Generic Telegram bot built by Sanji AI."""
 import os
 from pyrogram import Client, filters
@@ -144,19 +176,27 @@ def generate_bot_code(idea: str) -> tuple[str, str]:
     """Generate bot.py source for an idea.
 
     Returns (code, source) where source is 'openrouter', 'groq' or 'template'.
-    Tries OpenRouter (free coding model) first, then Groq, then the template.
+    Tries OpenRouter models in order (cohere/north-mini-code:free, then
+    openrouter/free), then Groq, then the template. Every AI failure is
+    logged (exception type + HTTP status, never the API key).
     """
     prompt = USER_PROMPT_TEMPLATE.format(idea=idea)
-    # 1. OpenRouter (free coding model) — primary.
+    # 1. OpenRouter (free tier) — primary. Try each model in order.
     or_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if or_key:
-        try:
-            raw = _openrouter_chat(prompt, OPENROUTER_MODEL, or_key)
-            code = _strip_fences(raw)
-            if code and _syntax_ok(code):
-                return code, "openrouter"
-        except Exception:  # noqa: BLE001 - fall through to Groq/template
-            pass
+        for model in OPENROUTER_MODELS:
+            try:
+                raw = _openrouter_chat(prompt, model, or_key)
+                code = _strip_fences(raw)
+                if code and _syntax_ok(code):
+                    return code, "openrouter"
+                log.warning("openrouter model %s returned unusable code "
+                            "(empty or syntax error)", model)
+            except Exception as exc:  # noqa: BLE001 - try next model
+                _log_ai_failure("openrouter", model, exc)
+        log.warning("openrouter: all models failed, falling back to groq")
+    else:
+        log.info("openrouter skipped: OPENROUTER_API_KEY not set")
     # 2. Groq — fallback.
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if api_key:
@@ -166,16 +206,23 @@ def generate_bot_code(idea: str) -> tuple[str, str]:
                 code = _strip_fences(raw)
                 if code and _syntax_ok(code):
                     return code, "groq"
-            except Exception:  # noqa: BLE001 - fall through to template
-                pass
+                log.warning("groq model %s returned unusable code "
+                            "(empty or syntax error)", model)
+            except Exception as exc:  # noqa: BLE001 - try next model
+                _log_ai_failure("groq", model, exc)
+        log.warning("groq: all models failed, falling back to template")
+    else:
+        log.info("groq skipped: GROQ_API_KEY not set")
+    log.warning("generate_bot_code: no AI succeeded, using template fallback")
     return FALLBACK_TEMPLATE, "template"
 
 
 def fix_bot_code(code: str, error_log: str) -> tuple[str, str]:
     """Ask AI to fix bot code given a deploy/runtime error log.
 
-    Tries OpenRouter first, then Groq. Returns (fixed_code, source).
-    Falls back to the original code on failure.
+    Tries OpenRouter models in order, then Groq. Returns (fixed_code, source).
+    Falls back to the original code on failure. Every AI failure is logged
+    (exception type + HTTP status, never the API key).
     """
     prompt = (
         "Fix this Pyrogram Telegram bot code so it runs without errors.\n\n"
@@ -186,23 +233,34 @@ def fix_bot_code(code: str, error_log: str) -> tuple[str, str]:
     )
     or_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if or_key:
-        try:
-            raw = _openrouter_chat(prompt, OPENROUTER_MODEL, or_key)
-            fixed = _strip_fences(raw)
-            if fixed and _syntax_ok(fixed):
-                return fixed, "openrouter-fix"
-        except Exception:  # noqa: BLE001 - fall through to Groq
-            pass
+        for model in OPENROUTER_MODELS:
+            try:
+                raw = _openrouter_chat(prompt, model, or_key)
+                fixed = _strip_fences(raw)
+                if fixed and _syntax_ok(fixed):
+                    return fixed, "openrouter-fix"
+                log.warning("openrouter model %s returned unusable fix "
+                            "(empty or syntax error)", model)
+            except Exception as exc:  # noqa: BLE001 - try next model
+                _log_ai_failure("openrouter", model, exc)
+        log.warning("openrouter: all models failed for fix, falling back to groq")
+    else:
+        log.info("openrouter skipped for fix: OPENROUTER_API_KEY not set")
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
+        log.info("groq skipped for fix: GROQ_API_KEY not set")
         return code, "unchanged"
-    try:
-        raw = _groq_chat(prompt, GROQ_MODEL, api_key)
-        fixed = _strip_fences(raw)
-        if fixed and _syntax_ok(fixed):
-            return fixed, "groq-fix"
-    except Exception:  # noqa: BLE001 - keep original code
-        pass
+    for model in (GROQ_MODEL, GROQ_FALLBACK_MODEL):
+        try:
+            raw = _groq_chat(prompt, model, api_key)
+            fixed = _strip_fences(raw)
+            if fixed and _syntax_ok(fixed):
+                return fixed, "groq-fix"
+            log.warning("groq model %s returned unusable fix "
+                        "(empty or syntax error)", model)
+        except Exception as exc:  # noqa: BLE001 - try next model
+            _log_ai_failure("groq", model, exc)
+    log.warning("fix_bot_code: no AI fix succeeded, keeping original code")
     return code, "unchanged"
 
 

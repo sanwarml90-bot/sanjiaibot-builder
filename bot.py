@@ -436,6 +436,8 @@ async def run_build_job(uid: int, data: dict) -> None:
                     f"fix nahi hua: {err}")
         await update(1, "done")
         note(f"Code likh liya ({'AI se' if source in ('groq', 'openrouter') else 'template se'}). ✅")
+        if source == "template":
+            note("AI se code nahi bana, isliye basic template deploy hua hai — isme group commands nahi honge.")
 
         # 2. GitHub repo + push
         await update(2, "doing")
