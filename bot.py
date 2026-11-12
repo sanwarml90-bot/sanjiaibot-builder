@@ -88,19 +88,24 @@ def _unprotect(value: str) -> str:
 
 
 # ---------------------------------------------------------------- registry
-def _read_registry() -> list[dict]:
-    """Read bot-runner/bots.json from the builder repo. [] if missing/invalid."""
+def _read_registry() -> list[dict] | None:
+    """Read bot-runner/bots.json from the builder repo.
+
+    [] only when the file genuinely does not exist yet (first registration).
+    None when the file cannot be parsed — the caller must abort instead of
+    writing, or a transient failure would wipe the whole registry.
+    """
     raw = github_api.get_file(GITHUB_OWNER, REGISTRY_REPO, REGISTRY_PATH, REGISTRY_BRANCH)
     if raw is None:
         return []
     try:
         entries = json.loads(raw)
     except json.JSONDecodeError:
-        log.warning("registry %s is not valid JSON — treating as empty", REGISTRY_PATH)
-        return []
+        log.warning("registry %s is not valid JSON — aborting, not treating as empty", REGISTRY_PATH)
+        return None
     if not isinstance(entries, list):
-        log.warning("registry %s is not a JSON list — treating as empty", REGISTRY_PATH)
-        return []
+        log.warning("registry %s is not a JSON list — aborting, not treating as empty", REGISTRY_PATH)
+        return None
     return entries
 
 
@@ -471,6 +476,13 @@ async def run_build_job(uid: int, data: dict) -> None:
         # (the repo is PUBLIC — a plaintext token must never land in it).
         await update(3, "doing")
         entries = await asyncio.to_thread(_read_registry)
+        if entries is None:
+            await update(3, "fail")
+            await progress.edit_text(
+                _progress_text("🔨 Bot build ho raha hai…", steps)
+                + "\n\n❌ Registry file padh nahi paya (GitHub se error) — bot register nahi hua, purani list ko chheda nahi gaya. Thodi der baad /newbot se dobara try karo."
+            )
+            return
         entries = [e for e in entries if e.get("username") != bot_username]
         entries.append({"username": bot_username,
                         "repo": f"{GITHUB_OWNER}/{repo}",
