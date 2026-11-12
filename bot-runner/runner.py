@@ -125,8 +125,14 @@ def _safe_name(username: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in username) or "bot"
 
 
-def _fetch_registry() -> list[dict]:
-    """Fetch + parse bots.json from the raw GitHub URL. [] on any failure."""
+def _fetch_registry() -> list[dict] | None:
+    """Fetch + parse bots.json from the raw GitHub URL.
+
+    Returns None when the fetch fails, so the caller skips this poll
+    instead of treating a transient failure as "no bots" (which used to
+    stop every running bot). Returns [] only when the registry genuinely
+    does not exist yet (404).
+    """
     try:
         req = urllib.request.Request(REGISTRY_URL, method="GET")
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -135,19 +141,19 @@ def _fetch_registry() -> list[dict]:
         if exc.code == 404:
             log.info("[bot-runner] registry not found yet (404) — no bots")
             return []
-        log.warning("[bot-runner] registry fetch failed (HTTP %s)", exc.code)
-        return []
+        log.warning("[bot-runner] registry fetch failed (HTTP %s) — skipping this poll", exc.code)
+        return None
     except Exception as exc:  # noqa: BLE001
-        log.warning("[bot-runner] registry fetch failed: %s", _scrub(str(exc)))
-        return []
+        log.warning("[bot-runner] registry fetch failed: %s — skipping this poll", _scrub(str(exc)))
+        return None
     try:
         entries = json.loads(raw)
     except json.JSONDecodeError:
-        log.warning("[bot-runner] registry is not valid JSON — ignoring this poll")
-        return []
+        log.warning("[bot-runner] registry is not valid JSON — skipping this poll")
+        return None
     if not isinstance(entries, list):
-        log.warning("[bot-runner] registry is not a JSON list — ignoring this poll")
-        return []
+        log.warning("[bot-runner] registry is not a JSON list — skipping this poll")
+        return None
     return entries
 
 
@@ -311,9 +317,14 @@ def _reconcile(running: dict[str, Bot]) -> None:
     """Sync running bots with the registry: start new, stop removed.
 
     A bot whose repo changed is restarted with the new repo. Bots already
-    running are left alone (no restart for unchanged entries).
+    running are left alone (no restart for unchanged entries). A failed
+    registry fetch skips this poll entirely — a transient GitHub failure
+    must never be read as "every bot was removed".
     """
-    desired = _entries_to_bots(_fetch_registry())
+    entries = _fetch_registry()
+    if entries is None:
+        return
+    desired = _entries_to_bots(entries)
     # Stop bots removed from the registry.
     for username in list(running):
         if username not in desired:
